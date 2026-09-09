@@ -47,8 +47,8 @@ if __name__ == '__main__':
         device = torch.device('cpu')
 
     for ff in tqdm(file_list):
-        ##* get info from path
-        save_name = ff.replace('/media/ruru/ad31566c-e032-4ffa-a8cf-751b9dbab424/work/CMRxRecon2025/ChallengeData/MultiCoil', 'MultiCoil').replace('.mat', '.h5')
+        ##* get info from path — derive relative path from the input root
+        save_name = os.path.splitext(os.path.relpath(ff, mat_folder))[0] + '.h5'
         save_name_file = join(save_folder, save_name)
         if not os.path.exists(pathlib.Path(save_name_file).parent):
             os.makedirs(pathlib.Path(save_name_file).parent)

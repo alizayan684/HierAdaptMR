@@ -161,6 +161,13 @@ class UpBlock(nn.Module):
                 CAB(in_dim, kernel_size, reduction, bias=bias, act=act, no_use_ca=no_use_ca)
             )
             self.attn_proj = nn.Conv2d(in_dim, in_dim *n_history , kernel_size=1, bias=bias)
+            self.history_attn = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_dim, in_dim // reduction, kernel_size=1, bias=bias),
+                act() if isinstance(act, type) else act,
+                nn.Conv2d(in_dim // reduction, in_dim, kernel_size=1, bias=bias),
+                nn.Sigmoid()
+            )
 
         self.fuse = nn.Sequential(*[CAB(in_dim+prompt_dim, kernel_size, reduction,
                                         bias=bias, act=act, no_use_ca=no_use_ca) for _ in range(n_cab)])
@@ -183,8 +190,8 @@ class UpBlock(nn.Module):
                 # history_feat: [1, in_dim*n_history, H, W] 例如 [1, 1320, H, W]
 
                 # 计算注意力权重并调整维度
-                attn_weight = torch.sigmoid(self.ca.CA.conv_du[-1](self.ca.CA.avg_pool(x)))
-                attn_weight = self.attn_proj(attn_weight)  # [1, 120, H, W] → [1, 1320, H, W]
+                attn_weight = self.history_attn(x)  # [B, in_dim, 1, 1]
+                attn_weight = self.attn_proj(attn_weight)  # [B, in_dim, 1, 1] → [B, in_dim*n_history, 1, 1]
 
                 # 应用注意力权重到历史特征
                 weighted_history = history_feat * attn_weight

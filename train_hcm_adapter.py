@@ -529,6 +529,8 @@ def cli_main(args):
     }
 
     model = MultiCenterAdaptivePromptMR(base_promptmr_config).to(device)
+    target_model = model.module if hasattr(model, 'module') else model
+    target_model.enable_hcm_collection = True
 
     best_SSIM = 0.0
     best_val_loss = float('inf')
@@ -566,7 +568,7 @@ def cli_main(args):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    fh = logging.FileHandler(os.path.join(args.experiments_output, 'train_multicenter.log'))
+    fh = logging.FileHandler(os.path.join(args.experiments_output, 'train_hcm_adapter.log'))
     fh.setLevel(logging.INFO)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
@@ -579,13 +581,14 @@ def cli_main(args):
     logger.addHandler(ch)
     writer = SummaryWriter(log_dir=args.experiments_output)
 
-    # 使用不同的学习率策略
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Freeze all models except pathology adapters
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+    for name, param in model.pathology_adapters.named_parameters():
+        param.requires_grad = True
+
     optimizer = torch.optim.AdamW([
-        {'params': model.base_model.parameters(), 'lr': args.lr},
-        {'params': model.center_adapters.parameters(), 'lr': args.lr*0.1},
-        {'params': model.contrast_adapters.parameters(), 'lr': args.lr*0.1},
-        {'params': model.pathology_adapters.parameters(), 'lr': args.lr*0.1}
+        {'params': model.pathology_adapters.parameters(), 'lr': args.lr}
     ], weight_decay=args.weight_decay)
 
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
@@ -613,10 +616,9 @@ def cli_main(args):
         epoch_train_loss = train_epoch(args, train_loaders, model, optimizer, scaler, epoch, writer)
         
         # Fit HCM gating at the end of every epoch so it's ready for validation
-        if hasattr(model, 'module') and model.module.hcm_gating.feature_buffer:
-            model.module.hcm_gating.fit()
-        elif hasattr(model, 'hcm_gating') and model.hcm_gating.feature_buffer:
-            model.hcm_gating.fit()
+        target_model_local = model.module if hasattr(model, 'module') else model
+        if hasattr(target_model_local, 'hcm_gating') and target_model_local.hcm_gating.feature_buffer:
+            target_model_local.hcm_gating.fit()
 
         epoch_val_loss, epoch_val_SSIM = validate(args, val_loaders, model, writer, epoch)
 

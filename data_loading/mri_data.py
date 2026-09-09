@@ -325,8 +325,8 @@ class CmrxReconSliceDataset(torch.utils.data.Dataset):
                         for mask_type in ['uniform', 'kt_gaussian', 'kt_radial']:
                             for acc in ['8', '16', '24']:
                                 raw_sample = RawDataSample(fname, slice_ind, metadata, mask_type, acc)
-                            if self.raw_sample_filter(raw_sample):
-                                new_raw_samples.append(raw_sample)
+                                if self.raw_sample_filter(raw_sample):
+                                    new_raw_samples.append(raw_sample)
 
 
                 self.raw_samples += new_raw_samples

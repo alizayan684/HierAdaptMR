@@ -772,17 +772,17 @@ class FixedLowRadialMaskFunc(MaskFunc):
         # Extract spatial and temporal dimensions
         *batch_dims, nx, ny, nt = shape
 
-        # Set random seed if provided
+        # Set random seed if provided — use local RandomState to avoid corrupting global numpy state
         if seed is not None:
             if isinstance(seed, (tuple, list)):
                 seed = sum(seed) % (2 ** 32)
-            np.random.seed(seed)
-
-        # Use provided rng or self.rng
-        if rng is not None:
-            used_rng = rng
+            used_rng = np.random.RandomState(seed)
         else:
-            used_rng = self.rng
+            # Use provided rng or self.rng
+            if rng is not None:
+                used_rng = rng
+            else:
+                used_rng = self.rng
 
         if acc:
             acceleration = int(acc)
@@ -800,14 +800,15 @@ class FixedLowRadialMaskFunc(MaskFunc):
         # Calculate number of calibration lines
         ncalib = int(center_fraction)
 
-        # Use the actual temporal dimension from shape, not the parameter**
-        actual_nt = nt  # Use the temporal dimension from shape
+        # Use num_t parameter for temporal dimension, not nt from shape
+        # (shape[-1] is 2 for complex real/imag, not the actual temporal frames)
+        actual_nt = num_t if num_t is not None else nt
 
         # Generate the k-t radial mask with correct temporal dimension
         mask_3d = self._generate_kt_radial_mask(
             nx=nx,
             ny=ny,
-            nt=actual_nt,  # Use actual temporal dimension
+            nt=actual_nt,
             ncalib=ncalib,
             R=acceleration,
             angle4next=self.angle4next,
@@ -821,7 +822,7 @@ class FixedLowRadialMaskFunc(MaskFunc):
 
             # Determine temporal index
             if seed is None:  # Training
-                ti = used_rng.randint(actual_nt)  # Use actual_nt instead of num_t
+                ti = used_rng.randint(actual_nt)
             else:  # Validation
                 ti = slice_idx // num_slc
 

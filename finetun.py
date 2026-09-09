@@ -19,19 +19,20 @@ from mri_utils.losses import SSIMLoss
 import torch.nn as nn
 
 
-def create_combined_dataloader(args, base_train_dataset):
+def create_combined_dataloader(args, base_train_dataset, epoch=0):
     """
     组合稳定采样和性能感知权重的数据加载器
     先进行稳定的分层采样，然后应用性能感知权重
     """
 
-    # 第一步：进行稳定的分层采样
+    # 第一步：进行分层采样
     if args.use_subset:
-        print(f"\n=== 步骤1: 创建稳定的训练子集 (比例: {args.subset_ratio}) ===")
+        epoch_seed = args.seed + epoch * 1000
+        print(f"\n=== 步骤1: 创建训练子集 Epoch {epoch} (比例: {args.subset_ratio}) ===")
         subset_dataset = uniform_stratified_sampling(
             base_train_dataset,
             subset_ratio=args.subset_ratio,
-            random_state=args.seed
+            random_state=epoch_seed
         )
         working_dataset = subset_dataset
     else:
@@ -273,16 +274,17 @@ def parse_alternative_filename_format_fixed(file_name):
         return 'unknown', 'unknown', 'unknown', 'unknown'
 
 
-def create_stable_train_dataloader(args, base_train_dataset):
+def create_stable_train_dataloader(args, base_train_dataset, epoch=0):
     """
-    创建稳定的训练数据加载器 - 只在开始时采样一次
+    创建稳定的训练数据加载器 - 每个epoch重新采样
     """
     if args.use_subset:
-        print(f"\n=== 创建稳定的训练子集 (比例: {args.subset_ratio}) ===")
+        epoch_seed = args.seed + epoch * 1000
+        print(f"\n=== 创建训练子集 Epoch {epoch} (比例: {args.subset_ratio}) ===")
         subset_dataset = uniform_stratified_sampling(
             base_train_dataset,
             subset_ratio=args.subset_ratio,
-            random_state=args.seed
+            random_state=epoch_seed
         )
         dataset = subset_dataset
     else:
@@ -294,9 +296,9 @@ def create_stable_train_dataloader(args, base_train_dataset):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=True,  # 添加这个
-        prefetch_factor=2,        # 添加这个
-        drop_last=True           # 添加这个
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+        drop_last=True
     )
 
 
@@ -397,27 +399,38 @@ def train_epoch(args, train_loader, model, optimizer, scaler, epoch, writer):
 
         # 获取文件名用于元数据提取
         filenames = batch.fname if hasattr(batch, 'fname') else None
+        slice_num = batch.slice_num if hasattr(batch, 'slice_num') else None
+        num_slc = batch.num_slc if hasattr(batch, 'num_slc') else None
 
-        # 确定当前batch的中心
-        center_name = 'default'
+        # 确定每个样本的中心权重
+        batch_size = recons_pred.shape[0] if 'recons_pred' in dir() else masked_kspace.shape[0]
+        loss_weights = []
         if filenames is not None:
-            # 修正语法错误
-            filename = str(filenames[0]) if isinstance(filenames, (list, tuple)) else str(filenames)
-            for center in center_loss_weights.keys():
-                if center in filename:
-                    center_name = center
-                    break
+            fnames = filenames if isinstance(filenames, (list, tuple)) else [filenames]
+            for fname in fnames:
+                fname_str = str(fname)
+                center_name = 'default'
+                for center in center_loss_weights.keys():
+                    if center in fname_str:
+                        center_name = center
+                        break
+                loss_weights.append(center_loss_weights.get(center_name, 1.0))
+        else:
+            loss_weights = [1.0] * batch_size
 
         with torch.cuda.amp.autocast():
-            recons_pred = model(masked_kspace, mask, filenames)
+            recons_pred = model(masked_kspace, mask, filenames, slice_num, num_slc)
 
         # 修正函数名
         base_loss = ssim_loss_fn(recons_pred.unsqueeze(1), target.unsqueeze(1),
                                 data_range=batch.max_value.to(args.device))
 
-        # 应用中心特异性权重
-        loss_weight = center_loss_weights.get(center_name, 1.0)
-        weighted_loss = base_loss * loss_weight
+        # 应用中心特异性权重 (per-sample)
+        if batch_size > 1:
+            weight_tensor = torch.tensor(loss_weights, device=base_loss.device, dtype=base_loss.dtype)
+            weighted_loss = (base_loss * weight_tensor).mean()
+        else:
+            weighted_loss = base_loss * loss_weights[0]
 
         total_loss = weighted_loss / accumulation_steps
 
@@ -444,7 +457,7 @@ def train_epoch(args, train_loader, model, optimizer, scaler, epoch, writer):
                 optimizer.step()
             optimizer.zero_grad()
 
-        running_loss += total_loss.item()
+        running_loss += base_loss.item()
 
         # 修正变量名
         last_loss_recons_ssim = base_loss  # 使用base_loss而不是未定义的loss_recons_ssim
@@ -488,6 +501,8 @@ def validate(args, val_loader, model, writer, epoch):
 
                 # 获取文件名
                 filenames = batch.fname if hasattr(batch, 'fname') else None
+                slice_num = batch.slice_num if hasattr(batch, 'slice_num') else None
+                num_slc = batch.num_slc if hasattr(batch, 'num_slc') else None
 
                 #  输入数据检查
                 if torch.isnan(masked_kspace).any() or torch.isinf(masked_kspace).any():
@@ -501,7 +516,7 @@ def validate(args, val_loader, model, writer, epoch):
                     continue
 
                 with torch.cuda.amp.autocast():
-                        recons_pred = model(masked_kspace, mask, filenames)
+                        recons_pred = model(masked_kspace, mask, filenames, slice_num, num_slc)
 
                 # 计算SSIM
                 ssim = 1- ssim_loss_fn(recons_pred.unsqueeze(1), target.unsqueeze(1),
@@ -610,6 +625,9 @@ def save_checkpoint(state, is_best, checkpoint_dir, filename='checkpoint.pth.tar
 
 def cli_main(args):
     device = torch.device(args.device)
+    if args.gpus > 1:
+        print(f"WARNING: --gpus={args.gpus} is set but multi-GPU training is not implemented. "
+              f"Running on single device: {device}")
 
     # 使用多中心自适应模型
     base_promptmr_config = {
@@ -635,20 +653,37 @@ def cli_main(args):
 
     model = MultiCenterAdaptivePromptMR(base_promptmr_config).to(device)
 
+    best_SSIM = 0.0
+    best_val_loss = float('inf')
+
     if args.use_checkpoint:
         checkpoint = torch.load(args.pretrained, map_location=args.device, weights_only=True)
         pretrained_state_dict = checkpoint['model_state_dict']
-        model.load_state_dict(pretrained_state_dict)
+        model.load_state_dict(pretrained_state_dict, strict=False)
+        if 'hcm_gating' in checkpoint and checkpoint['hcm_gating'] is not None:
+            model.hcm_gating.mean = checkpoint['hcm_gating']['mean']
+            model.hcm_gating.precision = checkpoint['hcm_gating']['precision']
+            model.hcm_gating.threshold = checkpoint['hcm_gating']['threshold']
+            model.hcm_gating.is_fitted = True
+            print("HCM gating stats loaded from checkpoint")
+        if args.resume:
+            # Same-stage resume: restore best-metric thresholds so previously
+            # saved best model is not overwritten by worse epochs.
+            if 'best_SSIM' in checkpoint:
+                best_SSIM = checkpoint['best_SSIM']
+            if 'best_val_loss' in checkpoint:
+                best_val_loss = checkpoint['best_val_loss']
+            print(f"Resuming same-stage training: best_SSIM={best_SSIM:.6f}, best_val_loss={best_val_loss:.6f}")
+        else:
+            # Transfer learning from a backbone checkpoint: best metrics belong
+            # to a different model/stage, so keep the fresh 0.0/inf thresholds.
+            print("Transfer learning from backbone checkpoint: best metrics reset (best_SSIM=0.0)")
         del checkpoint  # Release the memory used by the state_dict
         torch.cuda.empty_cache()  # Clear the cache to free up memory
     else:
         print("  No pretrained model loaded!")
         print("  All parameters will be trainable (not recommended for adaptation training)")
-        best_SSIM = 0.0
-        best_val_loss = float('inf')
 
-    best_SSIM = 0.0
-    best_val_loss = float('inf')
     # 设置日志
     logging.basicConfig(level=logging.INFO, format='%(message)s')
     logger = logging.getLogger()
@@ -698,7 +733,7 @@ def cli_main(args):
 
     for epoch in range(args.max_epochs):
         # 每个epoch重新创建训练数据加载器
-        train_loaders = create_combined_dataloader(args, base_train_dataset)
+        train_loaders = create_combined_dataloader(args, base_train_dataset, epoch)
 
         epoch_start_time = time.time()
         epoch_train_loss = train_epoch(args, train_loaders, model, optimizer, scaler, epoch, writer)
@@ -732,7 +767,12 @@ def cli_main(args):
             'best_val_loss': best_val_loss,
             'best_SSIM': best_SSIM,
             'current_val_loss': epoch_val_loss,
-            'current_SSIM': epoch_val_SSIM
+            'current_SSIM': epoch_val_SSIM,
+            'hcm_gating': {
+                'mean': model.hcm_gating.mean,
+                'precision': model.hcm_gating.precision,
+                'threshold': model.hcm_gating.threshold,
+            } if model.hcm_gating.is_fitted else None
         }, is_best, args.experiments_output, filename=f'checkpoint_epoch_{epoch_count}.pth.tar')
 
         # 早停检查
@@ -744,7 +784,7 @@ def cli_main(args):
 
         logger.info(f"Total Training Time after {epoch_count} epochs: {total_training_time:.2f} seconds")
         # 学习率调度
-        scheduler.step()
+        scheduler.step(epoch_val_SSIM)
 
 
     # 训练结束后的统计
@@ -795,10 +835,11 @@ def build_args():
     parser.add_argument("--experiments_output", default=pathlib.Path('/home/ruru/Documents/work/CMR2025/cmr2025_R1/output'))
     parser.add_argument("--pretrained", default=pathlib.Path('/home/ruru/Documents/work/CMR2025/summary_results/backbone_promptmrV2/result8/checkpoint_epoch_0.pth.tar'))
     parser.add_argument("--use_checkpoint", default=True, help="Use checkpoint (default: False)")
+    parser.add_argument("--resume", action="store_true", help="Resume same-stage training: restore best_SSIM/best_val_loss from --pretrained checkpoint. Omit for transfer learning from a backbone checkpoint (best metrics reset to 0.0/inf).")
     parser.add_argument("--use_subset", default=True)
     parser.add_argument("--subset_ratio", default=0.3)
     parser.add_argument("--batch_size", default=1, type=int)
-    parser.add_argument("--gpus", default=4, type=int, help="Number of GPUs to use")
+    parser.add_argument("--gpus", default=1, type=int, help="Number of GPUs to use (currently single-device only)")
     parser.add_argument("--device", default='cuda')
     parser.add_argument("--num_workers", default=1, type=int, help="Number of workers to use in data loader")
     parser.add_argument("--lr", default=0.00015, type=float, help="Adam learning rate")
