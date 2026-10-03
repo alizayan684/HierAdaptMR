@@ -1,7 +1,7 @@
 # HierAdaptMR — Cross-Center Cardiac MRI Reconstruction with Hierarchical Feature Adapters
 
  **[The Original Paper](https://arxiv.org/abs/2508.13026)** (Xu & Oksuz, *StatXL 2025*), developed for the **CMRxRecon2025** multi-center cardiac MRI (CMR) reconstruction challenge.
- Wait for our paper soon
+ **Wait for our paper soon**
 
 ---
 
